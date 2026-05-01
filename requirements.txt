@@ -1,0 +1,22 @@
+# =============================================================================
+# requirements.txt — Smart Load Balancer Dependencies
+# =============================================================================
+# [BARU - TUP-CD-2026-KEL4] File ini sebelumnya kosong.
+# Diisi berdasarkan seluruh import yang ditemukan di:
+#   - xds_server.py
+#   - qlearning/*.py
+#
+# Install: pip install -r requirements.txt
+# Versi di-pin agar reproducible di environment baru.
+# =============================================================================
+
+# xDS Server
+envoy-data-plane==2.0.0     # protobuf EDS builder
+grpclib==0.4.7              # gRPC server async
+
+# Q-Learning
+redis==5.0.1                # Redis client (Q-table, heartbeat, weights)
+requests==2.31.0            # Prometheus HTTP query
+
+# Shared
+protobuf>=4.21.0            # Dependency envoy-data-plane

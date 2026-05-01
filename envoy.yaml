@@ -1,0 +1,124 @@
+node:
+  id: lb-node-1
+  cluster: smart-lb-cluster
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+
+  listeners:
+    - name: listener_http
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 80
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: backend_servers
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+
+    - name: backend_servers
+      connect_timeout: 5s
+      type: EDS
+      ignore_health_on_host_removal: true
+      common_lb_config:
+        healthy_panic_threshold:
+          value: 0
+      track_cluster_stats:
+        per_endpoint_stats: true
+
+      # ── Active Health Check ────────────────────────────────
+      # Envoy secara aktif kirim HTTP request ke tiap backend
+      # untuk verifikasi status sebelum routing traffic.
+      health_checks:
+        - timeout: 2s
+          interval: 5s
+          # [FIX-1] Turun dari 3 → 2:
+          # Backend dianggap MATI setelah 2 gagal (10 detik)
+          # Sebelumnya 15 detik — terlalu lama, request yang
+          # masuk selama window itu dikirim ke backend mati
+          unhealthy_threshold: 2
+          # 1 sukses cukup untuk dianggap SEHAT kembali
+          healthy_threshold: 1
+          http_health_check:
+            path: "/"
+            # [FIX-2] Hanya 2xx yang dianggap sehat
+            # Sebelumnya 200-600 (termasuk 5xx dianggap sehat)
+            # Backend yang return 500 seharusnya tidak dapat traffic
+            expected_statuses:
+              - start: 200
+                end: 299
+
+      # ── Outlier Detection ──────────────────────────────────
+      # [FIX-3] Tambahan passive failure detection.
+      # Bekerja paralel dengan health check aktif di atas.
+      # Envoy monitor error rate real-time dari traffic nyata
+      # dan eject backend bermasalah lebih cepat dari interval
+      # health check berikutnya.
+      #
+      # Skenario: backend mati di antara health check interval
+      #   - Health check: deteksi dalam maks 10 detik (2×5s)
+      #   - Outlier detection: deteksi dalam hitungan request
+      outlier_detection:
+        # Eject jika 50% request ke backend ini gagal
+        # dalam satu interval (100ms default)
+        consecutive_5xx: 3
+        # Interval analisis error rate
+        interval: 5s
+        # Durasi backend di-eject sebelum dicoba lagi
+        base_ejection_time: 15s
+        # Maksimal 67% backend bisa di-eject bersamaan
+        # Menjamin minimal 1 backend selalu aktif menerima traffic
+        max_ejection_percent: 67
+        
+      eds_cluster_config:
+        service_name: backend_servers
+        eds_config:
+          resource_api_version: V3
+          api_config_source:
+            api_type: GRPC
+            transport_api_version: V3
+            grpc_services:
+              - envoy_grpc:
+                  cluster_name: xds_cluster
+
+    - name: xds_cluster
+      connect_timeout: 5s
+      type: STATIC
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 5678

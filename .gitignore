@@ -1,0 +1,64 @@
+# Python cache
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Environment / secrets
+.env
+.flaskenv
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials.json
+secrets.json
+config.local.*
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Cache / temp
+.cache/
+.pytest_cache/
+.ipynb_checkpoints/
+tmp/
+temp/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Database / local state
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated experiment output
+outputs/
+results/temp/
+data/temp/
+data/raw/
+
+# Large / generated model artifacts
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+
+# Old / local backup source
+/qlearning.py
+/qlearning-backup/
