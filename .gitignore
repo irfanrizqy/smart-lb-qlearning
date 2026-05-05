@@ -71,3 +71,16 @@ data/raw/
 *.backup-*
 redis_inspect.sh.backup-*
 xds_server.py.before-restore-*
+
+# Local backup files
+*.backup
+*.bak
+*.bak-*
+*.backup-*
+*.before-*
+*.before-restore-*
+redis_inspect.sh.before-*
+redis_inspect.sh.backup-*
+xds_server.py.before-*
+xds_server.py.backup
+xds_server.py.bak-*

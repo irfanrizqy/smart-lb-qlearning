@@ -622,9 +622,9 @@ if [ -n "$1" ]; then
         hyperparams|10)    cmd_hyperparams ;;
         lastupdated|11)    cmd_last_updated ;;
         degraded|12)       cmd_degraded ;;
-        t)                 cmd_training_status ;;
-        ton)               cmd_training_on ;;
-        toff)              cmd_training_off ;;
+        training|t)        cmd_training_status ;;
+        train-on|ton)      cmd_training_on ;;
+        train-off|toff)    cmd_training_off ;;
         history|h)         cmd_history_info ;;
         historylast|hl)    cmd_history_last ;;
         historyfirst|hf)   cmd_history_first ;;
@@ -637,7 +637,7 @@ if [ -n "$1" ]; then
         reset-all|r4)      cmd_reset_all ;;
         *)
             echo "Key tidak dikenal: $1"
-            echo "Gunakan: bash redis_inspect.sh [weights|heartbeat|cycle|epsilon|qtable|state|reward|stats|effectiveness|hyperparams|degraded|history|all|monitor|reset-qtable|reset-epsilon|reset-learn|reset-all]"
+            echo "Gunakan: bash redis_inspect.sh [weights|heartbeat|cycle|epsilon|qtable|state|reward|stats|effectiveness|hyperparams|degraded|training|train-on|train-off|history|all|monitor|reset-qtable|reset-epsilon|reset-learn|reset-all]"
             ;;
     esac
     exit 0
@@ -667,6 +667,9 @@ while true; do
         hr)  cmd_history_range ;;
         a)   cmd_all_keys ;;
         m)   cmd_monitor_live ;;
+        t)   cmd_training_status ;;
+        ton) cmd_training_on ;;
+        toff) cmd_training_off ;;
         r1)  cmd_reset_qtable ;;
         r2)  cmd_reset_epsilon ;;
         r3)  cmd_reset_learning ;;
