@@ -62,3 +62,12 @@ data/raw/
 # Old / local backup source
 /qlearning.py
 /qlearning-backup/
+
+# Local backup files
+*.backup
+*.bak
+*.bak-*
+*.before-restore-*
+*.backup-*
+redis_inspect.sh.backup-*
+xds_server.py.before-restore-*
