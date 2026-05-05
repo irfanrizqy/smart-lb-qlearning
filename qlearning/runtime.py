@@ -54,6 +54,26 @@ def has_valid_traffic(throughput):
     """True kalau traffic cukup untuk dianggap valid training."""
     return throughput is not None and throughput > MIN_VALID_THROUGHPUT
 
+def is_training_enabled():
+    """
+    True hanya kalau Redis flag qlearning_training_enabled aktif.
+
+    Tujuan:
+    - Routing tetap berjalan setiap cycle.
+    - Q-table hanya belajar saat sesi training/evaluasi yang memang dikontrol.
+    - Mencegah Q-table belajar dari idle traffic, dashboard polling,
+      health check, atau traffic background kecil.
+    """
+    try:
+        val = redis_client.get("qlearning_training_enabled")
+        if val is None:
+            return False
+
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+    except Exception as e:
+        logging.error(f"Read training flag error: {e}")
+        return False
 
 def wait_with_heartbeat(duration):
     """Sleep sambil tetap kirim heartbeat tiap max 5 detik."""
@@ -89,17 +109,38 @@ def save_runtime_state(epsilon, explore_count, exploit_count):
         logging.error(f"Redis write runtime state error: {e}")
 
 
-def write_idle_status(cycle, state, metrics, throughput, epsilon):
-    """Simpan status idle runtime tanpa mengotori training data."""
+def write_idle_status(
+    cycle,
+    state,
+    metrics,
+    throughput,
+    epsilon,
+    status="IDLE_NO_TRAFFIC",
+    reason=None,
+):
+    """
+    Simpan status runtime tanpa mengotori training data.
+
+    Dipakai untuk dua kondisi:
+    - IDLE_NO_TRAFFIC      : throughput tidak cukup untuk training
+    - TRAINING_DISABLED    : training flag Redis sedang OFF
+    """
     try:
-        redis_client.set("qlearning_runtime", json.dumps({
+        payload = {
             "cycle": cycle,
-            "status": "IDLE_NO_TRAFFIC",
+            "status": status,
             "state": list(state) if state is not None else None,
             "metrics": metrics,
             "throughput": round(throughput, 2) if throughput is not None else None,
             "epsilon": round(epsilon, 4),
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-        }))
+            "training_enabled": is_training_enabled(),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        if reason:
+            payload["reason"] = reason
+
+        redis_client.set("qlearning_runtime", json.dumps(payload))
+
     except Exception as e:
-        logging.error(f"Redis idle status error: {e}")
+        logging.error(f"Redis runtime status error: {e}")

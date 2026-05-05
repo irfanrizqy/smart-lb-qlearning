@@ -24,7 +24,7 @@ from .qtable import get_q_values
 # - EXPLORE lebih besar agar action random benar-benar diuji environment.
 # - EXPLOIT lebih kecil karena Q-values sudah mendorong backend terbaik.
 # Jangan set terlalu besar, nanti balik rasa one-hot.
-ACTION_BIAS_EXPLORE = 20.0
+ACTION_BIAS_EXPLORE = 15.0
 ACTION_BIAS_EXPLOIT = 10.0
 
 

@@ -66,6 +66,7 @@ from .runtime import (
     save_runtime_state,
     write_idle_status,
     has_valid_traffic,
+    is_training_enabled,
 )
 from .monitoring import write_monitoring, append_history_entry
 
@@ -168,10 +169,6 @@ def run_qlearning_loop():
             # STEP 2: Select action (epsilon-greedy)
             # ==========================================
             action, mode = select_action(q_table, state, epsilon)
-            if mode == "EXPLORE":
-                explore_count += 1
-            else:
-                exploit_count += 1
 
             cycle_started_at_dt = datetime.now()
             cycle_started_at    = cycle_started_at_dt.isoformat()
@@ -235,17 +232,56 @@ def run_qlearning_loop():
                 continue
 
             # ==========================================
-            # STEP 6: Training gate — skip jika idle
+            # STEP 6: Training gate
             # ==========================================
             throughput = get_throughput()
-            if SKIP_IDLE_TRAINING and not has_valid_traffic(throughput):
-                write_idle_status(cycle, new_state, new_metrics, throughput, epsilon)
+            training_enabled = is_training_enabled()
+
+            # Gate 1: training harus eksplisit diaktifkan via Redis.
+            # Routing tetap berjalan karena execute_action() sudah dilakukan di Step 3,
+            # tapi reward/Q-update/history tidak boleh jalan saat training OFF.
+            if not training_enabled:
+                write_idle_status(
+                    cycle,
+                    new_state,
+                    new_metrics,
+                    throughput,
+                    epsilon,
+                    status="TRAINING_DISABLED",
+                    reason="qlearning_training_enabled is not active",
+                )
                 logging.info(
-                    f"Cycle {cycle}: idle/no traffic "
+                    f"Cycle {cycle}: training disabled "
                     f"(throughput={throughput}) -> skip reward/Q-update/history"
                 )
                 logging.info("-" * 55)
                 continue
+
+            # Gate 2: walaupun training ON, traffic harus cukup valid.
+            # Ini mencegah Q-table belajar dari health check, dashboard polling,
+            # atau traffic background kecil.
+            if SKIP_IDLE_TRAINING and not has_valid_traffic(throughput):
+                write_idle_status(
+                    cycle,
+                    new_state,
+                    new_metrics,
+                    throughput,
+                    epsilon,
+                    status="IDLE_NO_TRAFFIC",
+                    reason="throughput below MIN_VALID_THROUGHPUT",
+                )
+                logging.info(
+                    f"Cycle {cycle}: idle/no valid traffic "
+                    f"(throughput={throughput}) -> skip reward/Q-update/history"
+                )
+                logging.info("-" * 55)
+                continue
+
+            # Baru dihitung sebagai keputusan training jika lolos gate.
+            if mode == "EXPLORE":
+                explore_count += 1
+            else:
+                exploit_count += 1
 
             # ==========================================
             # STEP 7: Calculate reward
@@ -298,10 +334,11 @@ def run_qlearning_loop():
             # ==========================================
             # STEP 8: Update Q-table
             # ==========================================
-            all_observed    = len(degraded) == 0 and len(new_degraded) == 0
-            q_update_skipped = False
+            all_observed        = len(degraded) == 0 and len(new_degraded) == 0
+            selected_sr_valid   = ep_sr is not None
+            q_update_skipped    = False
 
-            if all_observed:
+            if all_observed and selected_sr_valid:
                 old_q, new_q, q_change = update_q_value(
                     q_table, state, action, reward, new_state
                 )
@@ -319,11 +356,26 @@ def run_qlearning_loop():
                 new_q            = current_q[action]
                 q_change         = 0.0
                 q_changes.append(0.0)
-                all_degraded     = list(set(degraded + new_degraded))
+
+                skip_reasons = []
+
+                if not all_observed:
+                    all_degraded = list(set(degraded + new_degraded))
+                    skip_reasons.append(
+                        f"{len(all_degraded)} backend degraded "
+                        f"({[d.split('.')[-1] for d in all_degraded]})"
+                    )
+
+                if not selected_sr_valid:
+                    skip_reasons.append(
+                        f"endpoint SR backend target "
+                        f"{selected_backend.split('.')[-1]} tidak tersedia"
+                    )
+
                 logging.info(
-                    f"  Q-update: SKIP - {len(all_degraded)} backend degraded "
-                    f"({[d.split('.')[-1] for d in all_degraded]}). "
-                    f"State tidak representatif, Q-table dijaga bersih."
+                    "  Q-update: SKIP - "
+                    + "; ".join(skip_reasons)
+                    + ". State/reward tidak cukup representatif, Q-table dijaga bersih."
                 )
 
             new_state_str = ", ".join(level_names[s] for s in new_state)

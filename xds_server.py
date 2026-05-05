@@ -100,8 +100,13 @@ from config import (
 # Type URL wajib untuk ClusterLoadAssignment dalam protokol xDS v3.
 TYPE_URL_CLA = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment"
 
-# Level log: logging.DEBUG untuk Syarat 0 pass detail, logging.INFO untuk normal.
+# Level log: logging.DEBUG untuk detail, logging.INFO untuk normal.
 LOG_LEVEL = logging.INFO
+
+# Nama service systemd Q-Learning.
+# Pastikan sama dengan nama service di:
+#   /etc/systemd/system/qlearning.service
+QLEARNING_SERVICE_NAME = "qlearning"
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [xDS] %(message)s")
 log = logging.getLogger(__name__)
@@ -148,146 +153,164 @@ def is_reachable(host: str, port: int) -> bool:
         return result == 0  # connect_ex mengembalikan 0 jika berhasil
     except Exception:
         return False
+    
+def is_qlearning_service_active() -> bool:
+    """
+    Syarat 0:
+    Pastikan qlearning.service benar-benar aktif di systemd.
+
+    Kenapa perlu:
+    - current_weights bisa masih tersisa di Redis walaupun Q-Learning mati.
+    - heartbeat bisa masih fresh beberapa detik setelah service mati.
+    - xDS harus bisa fallback cepat kalau decision engine tidak aktif.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", QLEARNING_SERVICE_NAME],
+            timeout=1,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        log.warning(f"Cannot check {QLEARNING_SERVICE_NAME}.service status: {e}")
+        return False
 
 
 # ===========================================================================
 # LOGIKA UTAMA — Tentukan Mode Routing (backend vs. fallback)
 # ===========================================================================
 
-def get_weights_from_redis() -> tuple:
+def get_weights_from_redis():
     """
     Baca weight dari Redis dan tentukan apakah traffic boleh diteruskan ke backend.
 
-    Fungsi ini menegakkan kebijakan STRICT MODE. Selalu mengembalikan tuple:
+    Return WAJIB:
+        (weights, reason)
 
-        (weights_dict, reason_str)
+    Empat syarat STRICT MODE:
+        0. qlearning.service aktif di systemd
+        1. qlearning_heartbeat fresh
+        2. current_weights tersedia dan valid
+        3. minimal satu backend berbobot reachable
 
-        Backend mode  — weights_dict dengan ≥1 nilai positif, reason="ok".
-        Fallback mode — weights_dict semua nol, reason=string penjelasan.
+    Jika salah satu syarat gagal:
+        return FALLBACK_WEIGHTS, reason
 
-    Empat syarat HARUS terpenuhi semua sebelum backend mode diizinkan:
+    Jika semua syarat lolos:
+        return normalized_backend_weights, "backend_mode_strict"
 
-        0. systemd: qlearning.service harus berstatus "active".
-           Deteksi instan — tidak perlu tunggu heartbeat stale.
-           Tidak menangkap zombie (proses hidup tapi loop berhenti) —
-           itulah fungsi Syarat 1.
-
-        1. Heartbeat: key "qlearning_heartbeat" di Redis harus ada dan
-           timestamp-nya tidak lebih lama dari HEARTBEAT_TIMEOUT detik.
-           Safety net untuk zombie process.
-
-        2. Weight tersedia: key "current_weights" di Redis harus ada
-           dan total semua nilai weight harus lebih besar dari nol.
-
-        3. Minimal satu backend reachable: setiap backend dengan weight > 0
-           di-probe via TCP. Minimal satu harus berhasil.
-
-    Jika salah satu syarat gagal → fallback mode, tanpa pengecualian.
-
-    Returns:
-        (dict[str, int], str) — (weight map, alasan keputusan routing)
+    Catatan:
+        qlearning_training_enabled TIDAK dicek di sini.
+        Training OFF hanya berarti Q-table tidak di-update.
+        Selama Q-Learning service aktif, heartbeat fresh, weights valid,
+        dan backend reachable, xDS tetap harus mengirim backend ke Envoy.
     """
     FALLBACK_WEIGHTS = {ip: 0 for ip in BACKEND_IPS}
 
     try:
-        # ── Syarat 0: Status systemd qlearning.service ───────────────────────
-        # Menangkap: service stopped, killed, crashed (exit code non-zero).
-        # Tidak menangkap zombie — itulah fungsi Syarat 1 (heartbeat) di bawah.
-        try:
-            t0            = datetime.now()
-            result        = subprocess.run(
-                ["systemctl", "is-active", "qlearning.service"],
-                capture_output=True, text=True, timeout=2,
+        # ── Syarat 0: qlearning.service harus aktif ─────────────────────────
+        if not is_qlearning_service_active():
+            log.warning(
+                f"{QLEARNING_SERVICE_NAME}.service is not active -> fallback"
             )
-            elapsed_ms    = int((datetime.now() - t0).total_seconds() * 1000)
-            service_state = result.stdout.strip()
-
-            if service_state != "active":
-                reason = f"systemd={service_state}"
-                log.warning(f"FALLBACK triggered [REASON: {reason}]")
-                return FALLBACK_WEIGHTS, reason
-
-            # [Saran-6] Log DEBUG saat Syarat 0 lolos
-            log.debug(f"[Syarat 0] qlearning.service=active ({elapsed_ms}ms)")
-
-        except subprocess.TimeoutExpired:
-            log.warning("systemctl timeout (>2s) — skip Syarat 0, lanjut ke heartbeat")
-        except FileNotFoundError:
-            log.warning("systemctl tidak ditemukan — skip Syarat 0, lanjut ke heartbeat")
-        except Exception as e:
-            log.warning(f"Syarat 0 error: {e} — skip, lanjut ke heartbeat")
+            return FALLBACK_WEIGHTS, "qlearning_service_inactive"
 
         # ── Syarat 1: Heartbeat Q-Learning ──────────────────────────────────
-        # Safety net untuk zombie process: service "active" di systemd tapi
-        # Python loop-nya berhenti (hang/deadlock) sehingga tidak tulis heartbeat.
         heartbeat_str = redis_client.get("qlearning_heartbeat")
 
         if not heartbeat_str:
-            reason = "heartbeat_missing"
-            log.warning(f"FALLBACK triggered [REASON: {reason}]")
-            return FALLBACK_WEIGHTS, reason
+            log.warning("No Q-Learning heartbeat found in Redis -> fallback")
+            return FALLBACK_WEIGHTS, "no_qlearning_heartbeat"
 
         last_heartbeat  = datetime.strptime(heartbeat_str, "%Y-%m-%d %H:%M:%S")
-        seconds_elapsed = int((datetime.now() - last_heartbeat).total_seconds())
+        seconds_elapsed = (datetime.now() - last_heartbeat).total_seconds()
 
         if seconds_elapsed > HEARTBEAT_TIMEOUT:
-            reason = f"heartbeat_age={seconds_elapsed}s > limit={HEARTBEAT_TIMEOUT}s"
-            log.warning(f"FALLBACK triggered [REASON: {reason}]")
-            return FALLBACK_WEIGHTS, reason
+            log.warning(
+                f"Q-Learning heartbeat is {int(seconds_elapsed)}s old "
+                f"(limit: {HEARTBEAT_TIMEOUT}s) -> fallback"
+            )
+            return FALLBACK_WEIGHTS, "qlearning_heartbeat_timeout"
 
-        # ── Syarat 2: Weight tersedia dan tidak semua nol ────────────────────
+        # ── Syarat 2: Weight tersedia ───────────────────────────────────────
         weights_raw = redis_client.get("current_weights")
 
         if not weights_raw:
-            reason = "no_weights_in_redis"
-            log.warning(f"FALLBACK triggered [REASON: {reason}]")
-            return FALLBACK_WEIGHTS, reason
+            log.warning("Q-Learning is alive but no weights in Redis yet -> fallback")
+            return FALLBACK_WEIGHTS, "no_current_weights"
 
-        weights = json.loads(weights_raw)
+        raw_weights = json.loads(weights_raw)
+
+        # Sanitasi:
+        # - hanya IP yang dikenal di BACKEND_IPS
+        # - nilai negatif / invalid dianggap 0
+        weights = {}
+        for ip in BACKEND_IPS:
+            try:
+                weights[ip] = max(0, int(raw_weights.get(ip, 0)))
+            except Exception:
+                weights[ip] = 0
 
         if sum(weights.values()) == 0:
-            reason = "all_weights_zero"
-            log.warning(f"FALLBACK triggered [REASON: {reason}]")
-            return FALLBACK_WEIGHTS, reason
+            log.warning("Q-Learning is alive but all weights are zero -> fallback")
+            return FALLBACK_WEIGHTS, "all_weights_zero"
 
-        # ── Syarat 3: Minimal satu backend berbobot bisa dijangkau ───────────
-        # Hanya backend dengan weight > 0 yang di-probe.
-        # Backend berbobot nol memang tidak akan menerima traffic.
-        reachable_count = 0
-        reach_results   = {}
+        # ── Syarat 3: Probe backend berbobot ────────────────────────────────
+        filtered = {ip: 0 for ip in BACKEND_IPS}
 
         for ip, weight in weights.items():
-            if int(weight) > 0:
-                ok = is_reachable(ip, BACKEND_PORT)
-                reach_results[ip] = "✓" if ok else "✗"
-                if ok:
-                    reachable_count += 1
+            if weight <= 0:
+                continue
+
+            if is_reachable(ip, BACKEND_PORT):
+                filtered[ip] = weight
             else:
-                reach_results[ip] = "-"  # tidak di-probe, weight=0
+                log.warning(
+                    f"Backend {ip}:{BACKEND_PORT} is not reachable "
+                    f"-> weight forced to 0"
+                )
 
-        # [Saran-5] Log semua hasil probe sekaligus
-        # [xDS-2] Gunakan nama backend (web01/02/03) bukan IP mentah
-        reach_summary  = " ".join(
-            f"{IP_TO_BACKEND_NAME.get(ip, ip.split('.')[-1])}={status}"
-            for ip, status in reach_results.items()
-        )
-        unreachable_n  = sum(1 for s in reach_results.values() if s == "✗")
-        log.info(f"Reachability: {reach_summary} | {unreachable_n}/{len(reach_results)} unreachable")
+        reachable_total = sum(filtered.values())
 
-        if reachable_count == 0:
-            reason = "all_backends_unreachable"
-            log.error(f"FALLBACK triggered [REASON: {reason}]")
-            return FALLBACK_WEIGHTS, reason
+        if reachable_total == 0:
+            log.error(
+                "All weighted backends are unreachable despite Q-Learning being alive "
+                "-> fallback"
+            )
+            return FALLBACK_WEIGHTS, "all_weighted_backends_unreachable"
 
-        # ── Semua syarat terpenuhi → backend mode ────────────────────────────
-        return weights, "ok"
+        # ── Renormalisasi backend reachable ke total 100 ────────────────────
+        normalized_float = {
+            ip: (filtered[ip] / reachable_total) * 100.0
+            if filtered[ip] > 0 else 0.0
+            for ip in BACKEND_IPS
+        }
+
+        normalized = {
+            ip: int(normalized_float[ip])
+            for ip in BACKEND_IPS
+        }
+
+        diff = 100 - sum(normalized.values())
+
+        if diff > 0:
+            candidates = [ip for ip in BACKEND_IPS if filtered[ip] > 0]
+            target = max(
+                candidates,
+                key=lambda ip: normalized_float[ip] - normalized[ip]
+            )
+            normalized[target] += diff
+
+        elif diff < 0:
+            candidates = [ip for ip in BACKEND_IPS if normalized[ip] > 0]
+            target = max(candidates, key=lambda ip: normalized[ip])
+            normalized[target] += diff
+
+        log.info(f"Reachable normalized weights: {normalized}")
+        return normalized, "backend_mode_strict"
 
     except Exception as e:
-        # Tangkap semua error tak terduga (Redis down, JSON rusak, dsb.).
-        # Default ke fallback agar Envoy tidak pernah dibiarkan tanpa konfigurasi valid.
-        reason = f"unexpected_error={e}"
-        log.error(f"FALLBACK triggered [REASON: {reason}]")
-        return FALLBACK_WEIGHTS, reason
+        log.error(f"Unexpected error reading from Redis: {e} -> fallback")
+        return FALLBACK_WEIGHTS, "unexpected_error"
 
 
 # ===========================================================================
@@ -480,12 +503,17 @@ class EdsService(EndpointDiscoveryServiceBase):
                                 )
                                 extra  += f" | cycle={cycle} | ε={eps} | focus={focus}"
 
-                            # [xDS-4] Deteksi mode IDLE dari qlearning_runtime
+                            # [xDS-4] Deteksi status runtime Q-Learning
                             rt_raw = redis_client.get("qlearning_runtime")
                             if rt_raw:
                                 rt_data = json.loads(rt_raw)
-                                if rt_data.get("status") == "IDLE_NO_TRAFFIC":
-                                    extra += " | mode=IDLE (no training)"
+                                rt_status = rt_data.get("status")
+
+                                if rt_status == "IDLE_NO_TRAFFIC":
+                                    extra += " | mode=IDLE_NO_TRAFFIC"
+
+                                elif rt_status == "TRAINING_DISABLED":
+                                    extra += " | mode=TRAINING_DISABLED"
 
                             log.info(f"Heartbeat OK — age={age}s{extra}")
                     except Exception:
