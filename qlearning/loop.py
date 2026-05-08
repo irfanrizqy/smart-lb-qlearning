@@ -68,7 +68,7 @@ from .runtime import (
     has_valid_traffic,
     is_training_enabled,
 )
-from .monitoring import write_monitoring, append_history_entry
+from .monitoring import write_monitoring, append_history_entry, append_routing_entry
 
 
 # ============================================================
@@ -230,6 +230,17 @@ def run_qlearning_loop():
                     f"skip update Q-table"
                 )
                 continue
+
+            # Tulis routing decision log (selalu, sebelum training gate)
+            append_routing_entry(
+                cycle=cycle,
+                selected_backend=selected_backend,
+                action=action,
+                mode=mode,
+                routing_weights=routing_weights,
+                cycle_started_at=cycle_started_at,
+                cycle_ended_at=cycle_ended_at,
+            )
 
             # ==========================================
             # STEP 6: Training gate

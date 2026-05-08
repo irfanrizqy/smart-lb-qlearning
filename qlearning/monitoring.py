@@ -267,3 +267,39 @@ def append_history_entry(
 
     except Exception as e:
         logging.error(f"History logging error: {e}")
+
+
+def append_routing_entry(
+        cycle,
+        selected_backend,
+        action,
+        mode,
+        routing_weights,
+        cycle_started_at,
+        cycle_ended_at,
+):
+    """Tulis routing decision ke Redis — selalu ditulis, terlepas dari training gate.
+
+    Dipakai oleh JMeter CSV parser untuk join request timestamp ↔ keputusan Q-Learning
+    bahkan saat training dinonaktifkan (qlearning_training_enabled = 0).
+    """
+    try:
+        entry = {
+            "cycle": cycle,
+            "cycle_started_at": cycle_started_at,
+            "cycle_ended_at": cycle_ended_at,
+            "selected_backend": selected_backend,
+            "selected_backend_ip": selected_backend,
+            "selected_backend_name": IP_TO_BACKEND_NAME.get(selected_backend, selected_backend),
+            "action": action,
+            "action_mode": mode,
+            "routing_weights": routing_weights,
+        }
+        redis_client.rpush("qlearning_routing_log", json.dumps(entry))
+
+        log_len = redis_client.llen("qlearning_routing_log")
+        if log_len > HISTORY_MAX:
+            redis_client.ltrim("qlearning_routing_log", log_len - HISTORY_MAX, -1)
+
+    except Exception as e:
+        logging.error(f"Routing log error: {e}")
