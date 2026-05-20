@@ -10,11 +10,12 @@
 #   [ST-2] RAM TIDAK dinormalisasi — tetap persentase mentah.
 #          "Jika besar RAM-nya maka tetap besar klasifikasinya":
 #          VM dengan 80% RAM tetap HEAVY apapun ukuran total RAM-nya.
+#   [ST-3] RT masuk state sebagai dimensi ke-4 (5 level: FAST/NORMAL/ELEVATED/SLOW/CRIT).
 # =============================================================================
 
 import logging
 
-from config import BACKENDS, THRESHOLDS, W_CPU, W_RAM, ACTION_TO_IP, VM_CAPACITY
+from config import BACKENDS, THRESHOLDS, W_CPU, W_RAM, ACTION_TO_IP, VM_CAPACITY, RT_LEVEL_THRESHOLDS
 from .metrics import get_cpu, get_ram
 
 
@@ -39,7 +40,24 @@ def discretize(score):
     return len(THRESHOLDS)  # Level 4 (>= 80)
 
 
-def observe_state():
+# [ST-3] RT level — dimensi ke-4 state
+def get_rt_level(rt_ms):
+    """
+    Petakan response time (ms) ke level discrete (4 level).
+    L0: < 50ms    (FAST)
+    L1: 50–75ms   (NORMAL)
+    L2: 75–100ms  (ELEVATED)
+    L3: 100–150ms (SLOW)
+    L4: >= 150ms  (CRIT)
+    rt_ms=0.0 (default/tidak diketahui) → L0 agar tidak bias penalti.
+    """
+    for i, threshold in enumerate(RT_LEVEL_THRESHOLDS):
+        if rt_ms < threshold:
+            return i
+    return len(RT_LEVEL_THRESHOLDS)  # Level 3 (>= 600ms)
+
+
+def observe_state(last_rt_ms=0.0):
     """
     Observe state backend dari metrik CPU dan RAM tiap server.
 
@@ -54,14 +72,19 @@ def observe_state():
       saat CPU% terlihat sama.
     - [ST-2] RAM tetap persentase mentah — tidak dinormalisasi.
 
+    Parameter:
+    - last_rt_ms: Response time (ms) dari cycle sebelumnya, dipakai untuk
+      [ST-3] dimensi ke-4 state. Default 0.0 (FAST) saat belum ada data.
+
     Return:
     - metrics: dict per backend (berisi cpu raw, effective_cpu, ram, composite, level)
-    - state: tuple discrete state (level_vm3, level_vm4, level_vm5)
+    - state: tuple discrete state (level_vm3, level_vm4, level_vm5, rt_level)
     - success: bool
     - degraded: list backend IP yang gagal diobservasi
 
     Catatan:
-    - State merepresentasikan kondisi resource backend (effective load).
+    - State merepresentasikan kondisi resource backend (effective load) + RT cluster.
+    - RT diambil dari cycle sebelumnya karena nilai baru baru tersedia setelah wait.
     - Envoy / health check tetap menangani availability di layer data plane.
     - Q-learning memakai state ini sebagai dasar memilih SATU backend target.
     """
@@ -121,9 +144,11 @@ def observe_state():
 
     # [FIX] Pakai ACTION_TO_IP dari global config — tidak hardcode IP
     # Urutan: action 0 (vm3) → action 1 (vm4) → action 2 (vm5)
+    # [ST-3] Tambah rt_level sebagai dimensi ke-4 dari last_rt_ms cycle sebelumnya
+    rt_level = get_rt_level(last_rt_ms)
     state = tuple(
         metrics[ACTION_TO_IP[i]]["level"]
         for i in range(len(ACTION_TO_IP))
-    )
+    ) + (rt_level,)
 
     return metrics, state, True, degraded

@@ -30,6 +30,18 @@
 #   [CFG-7] qlearning/config.py (thin wrapper) DIHAPUS.
 #           Semua file di qlearning/ kini import langsung dari config (root).
 #           Tidak ada lagi lapisan perantara.
+#   [CFG-8] Tambah RT_LEVEL_THRESHOLDS dan NUM_RT_LEVELS — RT masuk sebagai
+#           dimensi ke-4 state (4 level: FAST/NORMAL/SLOW/CRIT).
+#           State space naik dari 125 (5^3) ke 500 (5^3 × 4).
+#           get_rt_level() di state.py memetakan ms → level.
+#   [CFG-9] Tambah konstanta Adaptive Epsilon — ADAPTIVE_EPSILON_WINDOW,
+#           ADAPTIVE_EPSILON_DEGRADATION, ADAPTIVE_EPSILON_BOOST,
+#           ADAPTIVE_EPSILON_MAX_BOOST. Dipakai loop.py untuk mendeteksi
+#           penurunan performa dan men-boost epsilon agar eksplorasi kembali.
+#   [CFG-10] Tambah ADAPTIVE_EPSILON_COOLDOWN — cooldown (cycle) setelah boost
+#            agar epsilon tidak di-boost setiap cycle selama degradasi panjang.
+#   [CFG-11] Pindahkan ACTION_BIAS_EXPLORE dan ACTION_BIAS_EXPLOIT dari
+#            weights.py ke config.py agar bisa dikonfigurasi tanpa edit source.
 # =============================================================================
 
 
@@ -121,7 +133,7 @@ VM_CAPACITY = {
 # TIMING
 # [TIDAK BERUBAH]
 # ---------------------------------------------------------------------------
-UPDATE_INTERVAL = 10     # Detik per Q-Learning cycle
+UPDATE_INTERVAL = 7     # Detik per Q-Learning cycle
 
 
 # ---------------------------------------------------------------------------
@@ -158,26 +170,55 @@ EPSILON_MODE         = "NORMAL"
 EPSILON_DECAY_NORMAL = 0.985
 EPSILON_DECAY_FAST   = 0.950
 
+# [CFG-9] Adaptive Epsilon — recovery otomatis saat performa turun
+# Loop menghitung avg reward window terbaru vs baseline window sebelumnya.
+# Jika selisihnya turun > ADAPTIVE_EPSILON_DEGRADATION, epsilon di-boost.
+# Epsilon tidak akan naik melebihi EPSILON_START - ADAPTIVE_EPSILON_MAX_BOOST.
+ADAPTIVE_EPSILON_WINDOW      = 20    # Jumlah cycle per window perbandingan
+ADAPTIVE_EPSILON_DEGRADATION = -0.15 # Threshold penurunan avg reward
+ADAPTIVE_EPSILON_BOOST       = 0.10  # Besar boost ε per deteksi degradasi
+ADAPTIVE_EPSILON_MAX_BOOST   = 0.30  # Batas atas ε setelah boost
+# [CFG-10] Cooldown — setelah boost, blokir boost berikutnya selama N cycle
+# Mencegah epsilon terus-menerus naik selama degradasi panjang (mis. traffic spike)
+ADAPTIVE_EPSILON_COOLDOWN    = 10    # Cycle jeda antar boost
+
 
 # ---------------------------------------------------------------------------
 # WEIGHT CALCULATION — Parameter calculate_weights() dinamis
 # [CFG-3] BARU — sebelumnya ada di dalam qlearning.py monolitik
 # ---------------------------------------------------------------------------
-MIN_WEIGHT = 10    # Minimum 10% per backend — anti starvation
-SMOOTHING  = 0.3   # 30% bobot baru, 70% bobot lama — anti oscillation
+MIN_WEIGHT = 15   # Minimum 15% per backend — anti starvation
+SMOOTHING  = 0.2   # 20% bobot baru, 80% bobot lama — anti oscillation
+
+# [CFG-11] Action bias — besar dorongan bobot ke backend target per action
+# EXPLORE lebih besar: action random perlu benar-benar diuji environment.
+# EXPLOIT lebih kecil: Q-values sudah mendorong backend terbaik, bias cukup halus.
+# Jangan set terlalu besar — distribusi akan mendekati one-hot dan mengabaikan
+# backend lain, yang merusak causality reward dan potensi starvation.
+ACTION_BIAS_EXPLORE = 10.0
+ACTION_BIAS_EXPLOIT = 5.0
 
 
 # ---------------------------------------------------------------------------
 # COMPOSITE SCORE (state observation)
 # [TIDAK BERUBAH]
 # ---------------------------------------------------------------------------
-W_CPU      = 0.5
-W_RAM      = 0.5
+W_CPU      = 0.4
+W_RAM      = 0.6
 THRESHOLDS = [20, 40, 60, 80]
 NUM_LEVELS = 5
 
+# [CFG-8] RT sebagai dimensi ke-4 state (dipakai get_rt_level() di state.py)
+# L0: <50ms FAST
+# L1: 50–75ms NORMAL
+# L2: 75–100ms ELEVATED
+# L3: 100–150ms SLOW
+# L4: >=150ms CRIT
+RT_LEVEL_THRESHOLDS = [50, 75, 100, 150]
+NUM_RT_LEVELS       = 5
+
 NUM_BACKENDS      = len(BACKENDS)
-TOTAL_STATE_SPACE = NUM_LEVELS ** NUM_BACKENDS  # 5^3 = 125
+TOTAL_STATE_SPACE = (NUM_LEVELS ** NUM_BACKENDS) * NUM_RT_LEVELS  # 5^3 × 5 = 625
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +241,7 @@ W_SUCCESS   = 0.30
 RT_MAX      = 500.0
 STD_MAX     = 50.0
 OVERLOAD_CPU = 90
-OVERLOAD_RAM = 90
+OVERLOAD_RAM = 85
 
 
 # ---------------------------------------------------------------------------

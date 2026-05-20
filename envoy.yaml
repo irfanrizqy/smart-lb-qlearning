@@ -33,6 +33,11 @@ static_resources:
                             prefix: "/"
                           route:
                             cluster: backend_servers
+                            # Timeout eksplisit — default Envoy 15s terlalu lama
+                            # untuk deteksi cepat backend lambat/mati saat load test.
+                            # 30s: cukup lama untuk request normal, cukup cepat
+                            # untuk tidak menggantung thread JMeter terlalu lama.
+                            timeout: 30s
                 http_filters:
                   - name: envoy.filters.http.router
                     typed_config:
@@ -61,8 +66,8 @@ static_resources:
           # Sebelumnya 15 detik — terlalu lama, request yang
           # masuk selama window itu dikirim ke backend mati
           unhealthy_threshold: 2
-          # 1 sukses cukup untuk dianggap SEHAT kembali
-          healthy_threshold: 1
+          # 2 sukses berturut-turut agar tidak flapping (bolak-balik sehat/sakit)
+          healthy_threshold: 2
           http_health_check:
             path: "/"
             # [FIX-2] Hanya 2xx yang dianggap sehat
@@ -83,8 +88,7 @@ static_resources:
       #   - Health check: deteksi dalam maks 10 detik (2×5s)
       #   - Outlier detection: deteksi dalam hitungan request
       outlier_detection:
-        # Eject jika 50% request ke backend ini gagal
-        # dalam satu interval (100ms default)
+        # Eject backend jika menghasilkan 3 error HTTP 5xx secara berturut-turut.
         consecutive_5xx: 3
         # Interval analisis error rate
         interval: 5s

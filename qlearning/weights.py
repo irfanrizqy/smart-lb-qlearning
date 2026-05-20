@@ -7,25 +7,17 @@
 #           Ini menjaga causality action -> traffic -> reward tanpa one-hot routing.
 #   [WGT-3] MIN_WEIGHT tetap dipakai agar backend lain tidak starvation.
 #   [WGT-4] Smoothing tetap dipakai untuk anti-oscillation.
+#   [WGT-5] ACTION_BIAS_EXPLORE dan ACTION_BIAS_EXPLOIT dipindah ke config.py
+#           [CFG-11] agar bisa dikonfigurasi tanpa mengedit source file ini.
 # =============================================================================
 
 import json
 import logging
 
 from .clients import redis_client
-from config import ACTION_TO_IP, NUM_ACTIONS, MIN_WEIGHT, SMOOTHING
+from config import ACTION_TO_IP, NUM_ACTIONS, MIN_WEIGHT, SMOOTHING, ACTION_BIAS_EXPLORE, ACTION_BIAS_EXPLOIT
 from .qtable import get_q_values
 
-
-# ============================================================
-# ACTION BIAS CONFIG
-# ============================================================
-# Bias ini sengaja kecil/sedang:
-# - EXPLORE lebih besar agar action random benar-benar diuji environment.
-# - EXPLOIT lebih kecil karena Q-values sudah mendorong backend terbaik.
-# Jangan set terlalu besar, nanti balik rasa one-hot.
-ACTION_BIAS_EXPLORE = 15.0
-ACTION_BIAS_EXPLOIT = 10.0
 
 
 def _normalize_with_min(working, ips, preferred_ips=None):
@@ -176,7 +168,7 @@ def calculate_weights(
 
     Args:
         q_table         : Q-table saat ini
-        state           : state tuple (level_vm3, level_vm4, level_vm5)
+        state           : state tuple (level_vm3, level_vm4, level_vm5, rt_level)
         previous_weights: dict {ip: weight} dari cycle sebelumnya, atau None
         degraded        : list IP backend yang gagal diobservasi
         action          : action terpilih oleh epsilon-greedy

@@ -1,8 +1,17 @@
-# [CFG-7 - TUP-CD-2026-KEL4] Import dari config (root) langsung.
-#   qlearning/config.py (thin wrapper) dihapus — tidak diperlukan lagi.
-#   WorkingDirectory=/root/smart-lb di systemd memastikan config.py ditemukan.
-# [TIDAK BERUBAH - TUP-CD-2026-KEL4] File ini tidak dimodifikasi.
-# Import dari .config tetap bekerja via qlearning/config.py (thin wrapper).
+# =============================================================================
+# qlearning/monitoring.py — Redis monitoring writer
+# =============================================================================
+# [DIUBAH - TUP-CD-2026-KEL4]
+#   [CFG-7] Import dari config (root) langsung — qlearning/config.py dihapus.
+#           WorkingDirectory=/root/smart-lb di systemd memastikan ditemukan.
+#   [MON-1] Import diperluas: RT_LEVEL_THRESHOLDS, NUM_RT_LEVELS,
+#           TOTAL_STATE_SPACE, dan semua ADAPTIVE_EPSILON_* dari config.
+#   [MON-2] q_table_total_states di effectiveness dict pakai TOTAL_STATE_SPACE
+#           (bukan hardcode) — otomatis benar jika state space berubah.
+#   [MON-3] Hyperparameters dict di Redis diperluas dengan konstanta RT dan
+#           adaptive epsilon sehingga dashboard/Grafana bisa membaca
+#           konfigurasi lengkap tanpa perlu baca file config secara langsung.
+# =============================================================================
 import json
 import time
 import logging
@@ -19,6 +28,11 @@ from config import (
     EPSILON_DECAY_NORMAL,
     EPSILON_DECAY_FAST,
     EPSILON_MODE,
+    ADAPTIVE_EPSILON_WINDOW,       # [CFG-9]
+    ADAPTIVE_EPSILON_DEGRADATION,  # [CFG-9]
+    ADAPTIVE_EPSILON_BOOST,        # [CFG-9]
+    ADAPTIVE_EPSILON_MAX_BOOST,    # [CFG-9]
+    ADAPTIVE_EPSILON_COOLDOWN,     # [CFG-10]
     W_CPU,
     W_RAM,
     W_RT,
@@ -27,6 +41,9 @@ from config import (
     W_OVERLOAD,
     THRESHOLDS,
     NUM_LEVELS,
+    RT_LEVEL_THRESHOLDS,           # [CFG-8]
+    NUM_RT_LEVELS,                 # [CFG-8]
+    TOTAL_STATE_SPACE,             # [CFG-8]
     RT_MAX,
     UPDATE_INTERVAL,
     ACTION_TO_IP,
@@ -36,6 +53,7 @@ from config import (
 
 def write_monitoring(
     cycle,
+    training_cycle,
     state,
     action,
     mode,
@@ -76,6 +94,7 @@ def write_monitoring(
 
         redis_client.set("qlearning_stats", json.dumps({
             "cycle": cycle,
+            "training_cycle": training_cycle,
             "state": list(state),
             "action": action,
             "selected_backend": selected_backend,
@@ -118,6 +137,7 @@ def write_monitoring(
         effectiveness = {
             "phase": phase,
             "cycles_total": cycle,
+            "training_cycles_total": training_cycle,
             "epsilon": round(epsilon, 4),
             "avg_reward_last_50": round(
                 sum(recent_rewards[-50:]) / max(len(recent_rewards[-50:]), 1), 4
@@ -132,7 +152,7 @@ def write_monitoring(
                 sum(recent_qchanges[-50:]) / max(len(recent_qchanges[-50:]), 1), 6
             ),
             "q_table_states_visited": len(q_table),
-            "q_table_total_states": 125,
+            "q_table_total_states": TOTAL_STATE_SPACE,
             "explore_count": explore_count,
             "exploit_count": exploit_count,
             "exploit_ratio_pct": exploit_ratio,
@@ -152,21 +172,29 @@ def write_monitoring(
             "epsilon": round(epsilon, 4),
             "epsilon_start": EPSILON_START,
             "epsilon_end": EPSILON_END,
-            "epsilon_mode":         EPSILON_MODE,
+            "epsilon_mode":          EPSILON_MODE,
             "epsilon_decay_normal":  EPSILON_DECAY_NORMAL,
             "epsilon_decay_fast":    EPSILON_DECAY_FAST,
+            "adaptive_epsilon_window":      ADAPTIVE_EPSILON_WINDOW,
+            "adaptive_epsilon_degradation": ADAPTIVE_EPSILON_DEGRADATION,
+            "adaptive_epsilon_boost":       ADAPTIVE_EPSILON_BOOST,
+            "adaptive_epsilon_max_boost":   ADAPTIVE_EPSILON_MAX_BOOST,
+            "adaptive_epsilon_cooldown":    ADAPTIVE_EPSILON_COOLDOWN,
             "w_cpu": W_CPU,
             "w_ram": W_RAM,
             "w_rt": W_RT,
             "w_success": W_SUCCESS,
             "w_balance": W_BALANCE,
             "w_overload": W_OVERLOAD,
-            "thresholds": THRESHOLDS,
-            "num_levels": NUM_LEVELS,
-            "rt_max": RT_MAX,
+            "thresholds":        THRESHOLDS,
+            "num_levels":        NUM_LEVELS,
+            "rt_level_thresholds": RT_LEVEL_THRESHOLDS,
+            "num_rt_levels":     NUM_RT_LEVELS,
+            "total_state_space": TOTAL_STATE_SPACE,
+            "rt_max":          RT_MAX,
             "update_interval": UPDATE_INTERVAL,
-            "history_max": HISTORY_MAX,
-            "num_actions": len(ACTION_TO_IP),
+            "history_max":     HISTORY_MAX,
+            "num_actions":     len(ACTION_TO_IP),
         }))
 
     except Exception as e:
@@ -175,6 +203,7 @@ def write_monitoring(
 
 def append_history_entry(
         cycle,
+        training_cycle,
         state,
         new_state,
         action,
@@ -204,6 +233,7 @@ def append_history_entry(
 
         history_entry = {
             "cycle": cycle,
+            "training_cycle": training_cycle,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "cycle_started_at": cycle_started_at,
             "cycle_ended_at": cycle_ended_at,
@@ -271,6 +301,7 @@ def append_history_entry(
 
 def append_routing_entry(
         cycle,
+        training_cycle,
         selected_backend,
         action,
         mode,
@@ -286,6 +317,7 @@ def append_routing_entry(
     try:
         entry = {
             "cycle": cycle,
+            "training_cycle": training_cycle,
             "cycle_started_at": cycle_started_at,
             "cycle_ended_at": cycle_ended_at,
             "selected_backend": selected_backend,

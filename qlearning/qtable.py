@@ -1,5 +1,13 @@
-# [TIDAK BERUBAH - TUP-CD-2026-KEL4] File ini tidak dimodifikasi.
-# Import dari .config tetap bekerja via qlearning/config.py (thin wrapper).
+# =============================================================================
+# qlearning/qtable.py — Q-Table management (load, save, update)
+# =============================================================================
+# [DIUBAH - TUP-CD-2026-KEL4]
+#   [QT-1] state_key() diperbaiki: dari hardcode 3 elemen menjadi dynamic join
+#          "_".join(str(s) for s in state) — mendukung state tuple berapa pun
+#          panjangnya. Perbaikan krusial untuk state 4-tuple setelah [ST-3].
+#          Tanpa fix ini, dimensi RT (elemen ke-4) dibuang secara diam-diam
+#          sehingga state (1,2,0,0) dan (1,2,0,3) dipetakan ke entry yang sama.
+# =============================================================================
 import json
 import logging
 
@@ -10,8 +18,8 @@ from config import BACKENDS, ALPHA, GAMMA
 # Q-TABLE MANAGEMENT
 # ============================================================
 def state_key(state):
-    """State tuple → string key untuk Redis."""
-    return f"{state[0]}_{state[1]}_{state[2]}"
+    """State tuple → string key untuk Redis. Mendukung tuple berapa pun panjangnya."""
+    return "_".join(str(s) for s in state)
 
 
 def init_q_values():

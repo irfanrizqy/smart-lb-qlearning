@@ -1,5 +1,4 @@
 # [TIDAK BERUBAH - TUP-CD-2026-KEL4] File ini tidak dimodifikasi.
-# Import dari .config tetap bekerja via qlearning/config.py (thin wrapper).
 # ============================================================
 # ACTION SELECTION: Epsilon-Greedy
 # ============================================================

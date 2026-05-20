@@ -12,7 +12,21 @@
 #   [LP-3]  get_endpoint_success_rates() dipanggil per cycle. SR backend
 #           yang dipilih diteruskan ke calculate_reward() sebagai
 #           endpoint_success_rate (bukan cluster-level success_rate).
-#   [LP-4]  Cluster-level success_rate tetap digunakan untuk logging info.
+#   [LP-4]  Cluster-level success_rate sebagai fallback log jika endpoint SR
+#           tidak tersedia. Query dilakukan lazy (hanya saat dibutuhkan)
+#           untuk menghemat 2 Prometheus query per cycle pada kasus normal.
+#   [LP-5]  RT masuk state sebagai dimensi ke-4: last_rt_ms dilacak antar cycle,
+#           observe_state(last_rt_ms) dipanggil dengan RT cycle sebelumnya.
+#           last_rt_ms diperbarui setelah STEP 7 jika response_time valid.
+#   [LP-6]  Adaptive epsilon: jika avg reward window terbaru turun lebih dari
+#           ADAPTIVE_EPSILON_DEGRADATION vs window sebelumnya, epsilon di-boost
+#           (tidak melebihi ADAPTIVE_EPSILON_MAX_BOOST dari nilai saat ini).
+#           Menggunakan reward_history dengan pembagian dua window.
+#   [LP-7]  Cooldown adaptive epsilon: setelah boost, blokir N cycle berikutnya
+#           agar epsilon tidak terus naik selama degradasi berkepanjangan.
+#           Cooldown dikontrol oleh ADAPTIVE_EPSILON_COOLDOWN dari config.
+#   [LP-8]  Log delta weight per cycle — menampilkan perubahan bobot setiap
+#           backend dibanding cycle sebelumnya agar pergeseran routing terlihat.
 # =============================================================================
 
 import logging
@@ -30,9 +44,14 @@ from config import (
     GAMMA,
     EPSILON_START,
     EPSILON_END,
-    EPSILON_MODE,           # [LP-1] BARU
-    EPSILON_DECAY_NORMAL,   # [LP-1] BARU
-    EPSILON_DECAY_FAST,     # [LP-1] BARU
+    EPSILON_MODE,                    # [LP-1] BARU
+    EPSILON_DECAY_NORMAL,            # [LP-1] BARU
+    EPSILON_DECAY_FAST,              # [LP-1] BARU
+    ADAPTIVE_EPSILON_WINDOW,         # [LP-6] BARU
+    ADAPTIVE_EPSILON_DEGRADATION,    # [LP-6] BARU
+    ADAPTIVE_EPSILON_BOOST,          # [LP-6] BARU
+    ADAPTIVE_EPSILON_MAX_BOOST,      # [LP-6] BARU
+    ADAPTIVE_EPSILON_COOLDOWN,       # [LP-7] BARU
     W_CPU,
     W_RAM,
     W_RT,
@@ -40,15 +59,19 @@ from config import (
     W_BALANCE,
     W_OVERLOAD,
     THRESHOLDS,
+    RT_LEVEL_THRESHOLDS,             # [LP-5] BARU
+    NUM_RT_LEVELS,                   # [LP-5] BARU
+    TOTAL_STATE_SPACE,               # [LP-5] BARU
     HISTORY_MAX,
     MAX_PROM_FAILURES,
     ACTION_TO_IP,
+    IP_TO_BACKEND_NAME,
     SKIP_IDLE_TRAINING,
     level_names,
 )
 from .qtable import load_q_table, save_q_table, get_q_values, update_q_value, state_key
 from .action import select_action
-from .state import observe_state
+from .state import observe_state, get_rt_level
 from .weights import execute_action
 from .metrics import (
     get_response_time,
@@ -69,6 +92,15 @@ from .runtime import (
     is_training_enabled,
 )
 from .monitoring import write_monitoring, append_history_entry, append_routing_entry
+
+# [LP-5] Nama level RT untuk logging — konsisten dengan level_names (CPU/RAM)
+RT_LEVEL_NAMES = {
+    0: "FAST",
+    1: "NORMAL",
+    2: "ELEVATED",
+    3: "SLOW",
+    4: "CRIT",
+}
 
 
 # ============================================================
@@ -96,7 +128,9 @@ def run_qlearning_loop():
     logging.info(f"Thresholds     : {THRESHOLDS} (5 levels: IDLE/LIGHT/MID/HEAVY/CRIT)")
     logging.info(f"Action space   : {len(ACTION_TO_IP)} focus-backend actions")
     logging.info(f"Weight method  : dynamic dari Q-values (bukan preset tetap)")
-    logging.info(f"State space    : 125 (5^3)  |  Q-table: 125x3 = 375 cells")
+    logging.info(f"State space    : {TOTAL_STATE_SPACE} (5^3×{NUM_RT_LEVELS})  |  Q-table: {TOTAL_STATE_SPACE}x{len(ACTION_TO_IP)} = {TOTAL_STATE_SPACE * len(ACTION_TO_IP)} cells")
+    logging.info(f"RT thresholds  : {RT_LEVEL_THRESHOLDS} ms (4 levels: FAST/NORMAL/SLOW/CRIT)")
+    logging.info(f"Adaptive ε     : window={ADAPTIVE_EPSILON_WINDOW}, degrad={ADAPTIVE_EPSILON_DEGRADATION}, boost={ADAPTIVE_EPSILON_BOOST}, cooldown={ADAPTIVE_EPSILON_COOLDOWN} cycle")
     logging.info(f"History max    : {HISTORY_MAX} cycle")
     logging.info("=" * 60)
 
@@ -109,16 +143,27 @@ def run_qlearning_loop():
     epsilon = load_epsilon()
 
     cycle = int(redis_client.get("qlearning_cycle") or 0)
+    training_cycle = int(redis_client.get("qlearning_training_cycle") or 0)
+
     if cycle > 0:
-        logging.info(f"Melanjutkan dari cycle {cycle}, epsilon={round(epsilon, 4)}")
+        logging.info(
+            f"Melanjutkan dari runtime cycle {cycle}, "
+            f"training cycle {training_cycle}, "
+            f"epsilon={round(epsilon, 4)}"
+        )
 
     runtime_state        = load_runtime_state()
     consecutive_failures = 0
     explore_count        = runtime_state.get("explore_count", 0)
     exploit_count        = runtime_state.get("exploit_count", 0)
+    # [LP-7] Restore cooldown dari Redis agar boost tidak menyala langsung setelah restart
+    adaptive_epsilon_cooldown = runtime_state.get("adaptive_epsilon_cooldown", 0)
 
     # [LP-2] Track previous_weights untuk smoothing di calculate_weights()
     previous_weights = None
+
+    # [LP-5] Track RT cycle sebelumnya untuk dimensi ke-4 state
+    last_rt_ms = 0.0
 
     reward_history = deque(maxlen=200)
     rt_history     = deque(maxlen=200)
@@ -133,7 +178,8 @@ def run_qlearning_loop():
             # ==========================================
             # STEP 1: Observe state (s)
             # ==========================================
-            metrics, state, success, degraded = observe_state()
+            # [LP-5] Sertakan last_rt_ms untuk dimensi ke-4 state
+            metrics, state, success, degraded = observe_state(last_rt_ms)
 
             if not success:
                 consecutive_failures += 1
@@ -166,9 +212,17 @@ def run_qlearning_loop():
                 )
 
             # ==========================================
-            # STEP 2: Select action (epsilon-greedy)
+            # STEP 2: Select action
             # ==========================================
-            action, mode = select_action(q_table, state, epsilon)
+            # Snapshot training flag SEKALI untuk seluruh cycle.
+            # Jangan baca ulang training flag di tengah cycle karena bisa berubah saat wait.
+            training_enabled_for_cycle = is_training_enabled()
+
+            if training_enabled_for_cycle:
+                action, mode = select_action(q_table, state, epsilon)
+            else:
+                action, _ = select_action(q_table, state, 0.0)
+                mode = "EVAL"
 
             cycle_started_at_dt = datetime.now()
             cycle_started_at    = cycle_started_at_dt.isoformat()
@@ -177,6 +231,9 @@ def run_qlearning_loop():
             # STEP 3: Execute action — dynamic weight dari Q-values
             # [LP-2] Pass q_table, state, previous_weights ke execute_action
             # ==========================================
+            # [LP-8] Snapshot sebelum di-overwrite agar delta bisa dihitung setelah execute
+            prev_weights_snapshot = previous_weights.copy() if previous_weights else None
+
             selected_backend, routing_weights, target_degraded = execute_action(
                 action=action,
                 q_table=q_table,
@@ -189,27 +246,44 @@ def run_qlearning_loop():
             # [LP-2] Simpan untuk dipakai cycle berikutnya (smoothing)
             previous_weights = routing_weights.copy()
 
-            state_str   = ", ".join(level_names[s] for s in state)
+            state_parts = [level_names[s] for s in state[:3]]
+            if len(state) > 3:
+                state_parts.append(RT_LEVEL_NAMES.get(state[3], str(state[3])))
+            state_str    = ", ".join(state_parts)
+            backend_name = IP_TO_BACKEND_NAME.get(selected_backend, selected_backend.split(".")[-1])
             degraded_str = (
                 f" | DEGRADED: {[d.split('.')[-1] for d in degraded]}"
                 if degraded else ""
             )
-            target_flag = " [TARGET-DEGRADED]" if target_degraded else ""
+            target_flag = " [DEGRADED-TARGET]" if target_degraded else ""
             logging.info(
-                f"Cycle {cycle} | State: ({state_str}) | "
-                f"Action: a{action}->{selected_backend.split('.')[-1]} "
-                f"[{mode}] | eps={round(epsilon, 3)}{degraded_str}{target_flag}"
+                f"Cycle {cycle} | {mode} | ε={round(epsilon, 4)}"
+                f" | ({state_str}) → a{action}→{backend_name}{target_flag}"
+                f"{degraded_str}"
             )
-            logging.info(f"  Weights (dynamic): {routing_weights}")
+            # [LP-8] Log weight dengan nama backend, delta, dan marker target
+            weight_parts = []
+            for ip, w in routing_weights.items():
+                name        = IP_TO_BACKEND_NAME.get(ip, ip.split(".")[-1])
+                target_mark = "[▶]" if ip == selected_backend else ""
+                if prev_weights_snapshot:
+                    d     = w - prev_weights_snapshot.get(ip, 0)
+                    delta = f"({d:+d})" if d != 0 else "(±0)"
+                else:
+                    delta = ""
+                weight_parts.append(f"{name}={w}%{delta}{target_mark}")
+            logging.info(f"  Weights : {' | '.join(weight_parts)}")
 
             for ip, m in metrics.items():
+                name   = IP_TO_BACKEND_NAME.get(ip, ip.split(".")[-1])
                 tag    = " [ASSUMED-CRIT]" if m.get("degraded") else ""
-                marker = " [TARGET]" if ip == selected_backend else ""
+                marker = " [▶]" if ip == selected_backend else ""
                 eff    = m.get("effective_cpu", m["cpu"])
                 logging.info(
-                    f"  {ip} -> CPU={m['cpu']}%(eff={eff}%) "
-                    f"RAM={m['ram']}% Comp={m['composite']} "
-                    f"[{level_names[m['level']]}]{tag}{marker}"
+                    f"  {name}({ip.split('.')[-1]}): [{level_names[m['level']]:5}]"
+                    f"  CPU={m['cpu']}%(eff={eff}%)"
+                    f"  RAM={m['ram']}%  Comp={m['composite']}"
+                    f"{tag}{marker}"
                 )
 
             # ==========================================
@@ -223,7 +297,8 @@ def run_qlearning_loop():
             # ==========================================
             # STEP 5: Observe new state (s')
             # ==========================================
-            new_metrics, new_state, new_success, new_degraded = observe_state()
+            # [LP-5] last_rt_ms masih dari cycle sebelumnya; akan diperbarui di STEP 7
+            new_metrics, new_state, new_success, new_degraded = observe_state(last_rt_ms)
             if not new_success:
                 logging.warning(
                     f"Cycle {cycle}: Semua backend gagal observe s', "
@@ -234,6 +309,7 @@ def run_qlearning_loop():
             # Tulis routing decision log (selalu, sebelum training gate)
             append_routing_entry(
                 cycle=cycle,
+                training_cycle=training_cycle,
                 selected_backend=selected_backend,
                 action=action,
                 mode=mode,
@@ -246,7 +322,7 @@ def run_qlearning_loop():
             # STEP 6: Training gate
             # ==========================================
             throughput = get_throughput()
-            training_enabled = is_training_enabled()
+            training_enabled = training_enabled_for_cycle
 
             # Gate 1: training harus eksplisit diaktifkan via Redis.
             # Routing tetap berjalan karena execute_action() sudah dilakukan di Step 3,
@@ -260,11 +336,18 @@ def run_qlearning_loop():
                     epsilon,
                     status="TRAINING_DISABLED",
                     reason="qlearning_training_enabled is not active",
+                    training_cycle=training_cycle,
+                    action=action,
+                    action_mode=mode,
+                    selected_backend=selected_backend,
+                    routing_weights=routing_weights,
                 )
                 logging.info(
                     f"Cycle {cycle}: training disabled "
-                    f"(throughput={throughput}) -> skip reward/Q-update/history"
+                    f"(snapshot={training_enabled_for_cycle}, throughput={throughput}) "
+                    f"-> skip reward/Q-update/history"
                 )
+
                 logging.info("-" * 55)
                 continue
 
@@ -280,13 +363,25 @@ def run_qlearning_loop():
                     epsilon,
                     status="IDLE_NO_TRAFFIC",
                     reason="throughput below MIN_VALID_THROUGHPUT",
+                    training_cycle=training_cycle,
+                    action=action,
+                    action_mode=mode,
+                    selected_backend=selected_backend,
+                    routing_weights=routing_weights,
                 )
+
                 logging.info(
                     f"Cycle {cycle}: idle/no valid traffic "
-                    f"(throughput={throughput}) -> skip reward/Q-update/history"
+                    f"(snapshot={training_enabled_for_cycle}, throughput={throughput}) "
+                    f"-> skip reward/Q-update/history"
                 )
+
                 logging.info("-" * 55)
                 continue
+
+            # Baru dianggap training cycle jika training ON dan traffic valid
+            training_cycle += 1
+            redis_client.set("qlearning_training_cycle", training_cycle)
 
             # Baru dihitung sebagai keputusan training jika lolos gate.
             if mode == "EXPLORE":
@@ -299,7 +394,10 @@ def run_qlearning_loop():
             # [LP-3] Gunakan per-endpoint SR untuk backend yang dipilih
             # ==========================================
             response_time = get_response_time()
-            success_rate  = get_success_rate()   # [LP-4] cluster-level untuk logging
+
+            # [LP-5] Perbarui last_rt_ms untuk dimensi ke-4 state cycle berikutnya
+            if response_time is not None:
+                last_rt_ms = response_time
 
             # [LP-3] Query SR per endpoint dari Envoy
             endpoint_srs = get_endpoint_success_rates()
@@ -319,28 +417,30 @@ def run_qlearning_loop():
             reward_history.append(reward)
             rt_history.append(response_time)
 
-            logging.info(
-                f"  Reward: {reward_detail['total']} "
-                f"(RT={reward_detail['rt_normalized']}, "
-                f"SR_ep={reward_detail['sr_penalty']}, "
-                f"Bal={reward_detail['load_imbalance']}, "
-                f"OL={reward_detail['overload_count']})"
-            )
+            # RT / SR / Throughput — satu baris ringkas
+            info_parts = []
             if response_time is not None:
-                logging.info(f"  Response Time: {round(response_time, 2)}ms (cluster)")
+                rt_lvl_name = RT_LEVEL_NAMES.get(get_rt_level(response_time), "?")
+                info_parts.append(f"RT={round(response_time, 2)}ms [{rt_lvl_name}]")
             if ep_sr is not None:
-                logging.info(
-                    f"  Endpoint SR ({selected_backend.split('.')[-1]}): "
-                    f"{round(ep_sr * 100, 1)}%"
-                )
-            elif success_rate is not None:
-                # [LP-4] Fallback ke cluster-level jika endpoint SR tidak tersedia
-                logging.info(
-                    f"  Success Rate (cluster): {round(success_rate * 100, 1)}% "
-                    f"(endpoint SR tidak tersedia)"
-                )
+                info_parts.append(f"SR({backend_name})={round(ep_sr * 100, 1)}%")
+            else:
+                # [LP-4] Lazy query cluster-level SR — hanya jika endpoint SR tidak tersedia
+                success_rate = get_success_rate()
+                if success_rate is not None:
+                    info_parts.append(f"SR(cluster)={round(success_rate * 100, 1)}%")
             if throughput is not None:
-                logging.info(f"  Throughput: {round(throughput, 2)} req/s")
+                info_parts.append(f"Throughput={round(throughput, 2)} req/s")
+            if info_parts:
+                logging.info(f"  {' | '.join(info_parts)}")
+
+            logging.info(
+                f"  Reward={reward_detail['total']}"
+                f"  (RT={reward_detail['rt_normalized']},"
+                f" SR={reward_detail['sr_penalty']},"
+                f" Bal={reward_detail['load_imbalance']},"
+                f" OL={reward_detail['overload_count']})"
+            )
 
             # ==========================================
             # STEP 8: Update Q-table
@@ -355,10 +455,11 @@ def run_qlearning_loop():
                 )
                 save_q_table(q_table)
                 q_changes.append(q_change)
+                q_delta = new_q - old_q
                 logging.info(
-                    f"  Q-update: Q[({state_key(state)}), a{action}] "
-                    f"{round(old_q, 4)} -> {round(new_q, 4)} "
-                    f"(d={round(q_change, 4)})"
+                    f"  Q[({state_key(state)}), a{action}]:"
+                    f" {round(old_q, 4)} → {round(new_q, 4)}"
+                    f"  Δ={round(q_delta, 4):+.4f}"
                 )
             else:
                 q_update_skipped = True
@@ -384,17 +485,19 @@ def run_qlearning_loop():
                     )
 
                 logging.info(
-                    "  Q-update: SKIP - "
+                    "  Q[SKIP] — "
                     + "; ".join(skip_reasons)
-                    + ". State/reward tidak cukup representatif, Q-table dijaga bersih."
+                    + ". Q-table tidak diupdate."
                 )
 
-            new_state_str = ", ".join(level_names[s] for s in new_state)
+            new_state_parts = [level_names[s] for s in new_state[:3]]
+            new_state_parts.append(RT_LEVEL_NAMES.get(new_state[3], str(new_state[3])) if len(new_state) > 3 else "?")
+            new_state_str = ", ".join(new_state_parts)
             avg_reward    = sum(reward_history) / len(reward_history)
             logging.info(
-                f"  New State: ({new_state_str}) | "
-                f"Avg Reward: {round(avg_reward, 4)} | "
-                f"Q-states: {len(q_table)}/125"
+                f"  ({state_str}) → ({new_state_str})"
+                f"  |  AvgR={round(avg_reward, 4)}"
+                f"  |  Q-states={len(q_table)}/{TOTAL_STATE_SPACE}"
             )
 
             combined_degraded = list(set(degraded + new_degraded))
@@ -404,6 +507,7 @@ def run_qlearning_loop():
             # ==========================================
             write_monitoring(
                 cycle=cycle,
+                training_cycle=training_cycle,
                 state=state,
                 action=action,
                 mode=mode,
@@ -427,6 +531,7 @@ def run_qlearning_loop():
 
             append_history_entry(
                 cycle=cycle,
+                training_cycle=training_cycle,
                 state=state,
                 new_state=new_state,
                 action=action,
@@ -453,10 +558,42 @@ def run_qlearning_loop():
             # ==========================================
             # STEP 10: Decay epsilon & simpan
             # [LP-1] Gunakan epsilon_decay yang sudah dipilih berdasarkan mode
+            # [LP-6] Adaptive epsilon: boost ε jika performa degradasi
             # ==========================================
             epsilon = max(EPSILON_END, epsilon * epsilon_decay)
+
+            # [LP-6][LP-7] Deteksi degradasi hanya jika reward_history cukup panjang
+            if len(reward_history) >= ADAPTIVE_EPSILON_WINDOW * 2:
+                half = ADAPTIVE_EPSILON_WINDOW
+                recent_avg   = sum(list(reward_history)[-half:]) / half
+                baseline_avg = sum(list(reward_history)[-half * 2:-half]) / half
+                delta = recent_avg - baseline_avg
+                if delta < ADAPTIVE_EPSILON_DEGRADATION:
+                    if adaptive_epsilon_cooldown > 0:
+                        # [LP-7] Masih dalam cooldown — tunda boost
+                        adaptive_epsilon_cooldown -= 1
+                        logging.info(
+                            f"  [Adaptive ε] Performa turun {round(delta,4)} "
+                            f"tapi masih cooldown ({adaptive_epsilon_cooldown} cycle tersisa) — skip"
+                        )
+                    else:
+                        boosted = min(epsilon + ADAPTIVE_EPSILON_BOOST, ADAPTIVE_EPSILON_MAX_BOOST)
+                        boosted = max(boosted, epsilon)   # tidak turunkan ε
+                        logging.info(
+                            f"  [Adaptive ε] Performa turun {round(delta,4)} "
+                            f"(baseline={round(baseline_avg,4)} -> recent={round(recent_avg,4)}). "
+                            f"ε di-boost: {round(epsilon,4)} -> {round(boosted,4)} "
+                            f"| cooldown aktif {ADAPTIVE_EPSILON_COOLDOWN} cycle"
+                        )
+                        epsilon = boosted
+                        adaptive_epsilon_cooldown = ADAPTIVE_EPSILON_COOLDOWN
+                else:
+                    # Performa normal — kurangi cooldown lebih cepat (atau reset)
+                    if adaptive_epsilon_cooldown > 0:
+                        adaptive_epsilon_cooldown -= 1
+
             save_epsilon(epsilon)
-            save_runtime_state(epsilon, explore_count, exploit_count)
+            save_runtime_state(epsilon, explore_count, exploit_count, adaptive_epsilon_cooldown)
 
             logging.info("-" * 55)
 
@@ -469,7 +606,7 @@ def run_qlearning_loop():
             f"Avg reward      : "
             f"{round(sum(reward_history)/max(len(reward_history),1), 4)}"
         )
-        logging.info(f"Q-table states  : {len(q_table)}/125")
+        logging.info(f"Q-table states  : {len(q_table)}/{TOTAL_STATE_SPACE}")
         logging.info(
             f"Explore/Exploit : {explore_count}/{exploit_count} "
             f"({round(exploit_count/max(total_decisions,1)*100,1)}% exploit)"

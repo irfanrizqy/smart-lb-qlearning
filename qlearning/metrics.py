@@ -7,6 +7,8 @@
 #           Dipakai reward.py sebagai pengganti cluster-level success rate
 #           agar reward lebih akurat untuk backend yang dipilih.
 #   [MET-2] Tambah import BACKEND_IPS, BACKEND_PORT untuk query per endpoint.
+#   [MET-3] Hapus get_selected_backend_load() — dead code, tidak pernah
+#           diimport atau dipanggil dari manapun di seluruh codebase.
 # =============================================================================
 
 from config import UPDATE_INTERVAL, BACKEND_IPS, BACKEND_PORT
@@ -178,15 +180,3 @@ def get_endpoint_success_rates():
     return results
 
 
-def get_selected_backend_load(selected_backend, metrics):
-    """
-    Ambil composite load backend target dari hasil observe_state().
-
-    Return:
-    - composite score backend target
-    - None jika backend target tidak ada di metrics
-    """
-    backend_metrics = metrics.get(selected_backend)
-    if not backend_metrics:
-        return None
-    return backend_metrics.get("composite")

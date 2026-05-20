@@ -43,6 +43,8 @@ Tanggung jawab (STRICT):
             untuk tampilkan cycle dan epsilon Q-Learning.
     [xDS-4] xDS baca qlearning_runtime untuk deteksi mode IDLE
             dan tampilkan di log Heartbeat OK.
+    [xDS-5] is_reachable() diperbaiki: socket dijamin ditutup via finally
+            meski exception terjadi sebelum connect_ex selesai.
 """
 
 import asyncio
@@ -145,14 +147,16 @@ def is_reachable(host: str, port: int) -> bool:
         True  — backend menerima koneksi.
         False — koneksi ditolak, timeout, atau terjadi network error.
     """
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(REACH_TIMEOUT)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        return result == 0  # connect_ex mengembalikan 0 jika berhasil
+        return sock.connect_ex((host, port)) == 0
     except Exception:
         return False
+    finally:
+        if sock is not None:
+            sock.close()
     
 def is_qlearning_service_active() -> bool:
     """
@@ -318,8 +322,6 @@ def get_weights_from_redis():
 # Tiga fungsi berikut menerjemahkan data Python biasa ke dalam struktur
 # protobuf xDS yang diharapkan Envoy.
 # ===========================================================================
-
-# update tengah malam
 
 def build_backend_cla(weights: dict) -> ClusterLoadAssignment:
     """

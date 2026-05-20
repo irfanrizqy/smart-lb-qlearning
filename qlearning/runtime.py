@@ -1,5 +1,12 @@
-# [TIDAK BERUBAH - TUP-CD-2026-KEL4] File ini tidak dimodifikasi.
-# Import dari .config tetap bekerja via qlearning/config.py (thin wrapper).
+# =============================================================================
+# qlearning/runtime.py — Epsilon, heartbeat, runtime state management
+# =============================================================================
+# [DIUBAH - TUP-CD-2026-KEL4]
+#   [RT-1] save_runtime_state() ditambah parameter adaptive_epsilon_cooldown
+#          (default=0) agar cooldown adaptive epsilon dipersist ke Redis.
+#          load_runtime_state() otomatis membacanya kembali saat restart
+#          sehingga cooldown tidak reset di tengah episode degradasi.
+# =============================================================================
 import json
 import time
 import logging
@@ -96,13 +103,14 @@ def load_runtime_state():
     return {}
 
 
-def save_runtime_state(epsilon, explore_count, exploit_count):
+def save_runtime_state(epsilon, explore_count, exploit_count, adaptive_epsilon_cooldown=0):
     """Persist runtime state inti Q-learning."""
     try:
         redis_client.set("qlearning_runtime_state", json.dumps({
             "epsilon": round(epsilon, 6),
             "explore_count": explore_count,
             "exploit_count": exploit_count,
+            "adaptive_epsilon_cooldown": adaptive_epsilon_cooldown,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }))
     except Exception as e:
@@ -117,6 +125,11 @@ def write_idle_status(
     epsilon,
     status="IDLE_NO_TRAFFIC",
     reason=None,
+    training_cycle=None,
+    action=None,
+    action_mode=None,
+    selected_backend=None,
+    routing_weights=None,
 ):
     """
     Simpan status runtime tanpa mengotori training data.
@@ -128,12 +141,17 @@ def write_idle_status(
     try:
         payload = {
             "cycle": cycle,
+            "training_cycle": training_cycle,
             "status": status,
             "state": list(state) if state is not None else None,
             "metrics": metrics,
             "throughput": round(throughput, 2) if throughput is not None else None,
             "epsilon": round(epsilon, 4),
             "training_enabled": is_training_enabled(),
+            "action": action,
+            "action_mode": action_mode,
+            "selected_backend": selected_backend,
+            "routing_weights": routing_weights,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 

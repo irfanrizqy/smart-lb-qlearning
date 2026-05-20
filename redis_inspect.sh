@@ -79,12 +79,22 @@ cmd_heartbeat() {
 
 cmd_cycle() {
     header "CYCLE COUNTER"
+
     local cycle
-    cycle=$($REDIS GET qlearning_cycle)
+    local training_cycle
+
+    cycle=$($REDIS GET qlearning_cycle 2>/dev/null)
+    training_cycle=$($REDIS GET qlearning_training_cycle 2>/dev/null)
+
     echo ""
-    echo -e "${CYN}▶ Total cycle berjalan${NC}"
+    echo -e "${CYN}▶ Runtime / Routing Cycle${NC}"
     divider
-    echo -e "  Cycle ke: ${WHT}${cycle:-0}${NC}"
+    echo -e "  qlearning_cycle          : ${WHT}${cycle:-0}${NC}"
+    echo -e "  qlearning_training_cycle : ${WHT}${training_cycle:-0}${NC}"
+    echo ""
+    echo -e "  ${YLW}Cara baca:${NC}"
+    echo -e "    - qlearning_cycle          = semua cycle runtime/routing"
+    echo -e "    - qlearning_training_cycle = cycle yang benar-benar lolos training gate"
 }
 
 cmd_epsilon() {
@@ -105,25 +115,71 @@ cmd_qtable() {
     echo ""
     echo -e "${CYN}▶ Jumlah state yang sudah dikunjungi${NC}"
     divider
+
     local qtable
-    qtable=$($REDIS GET q_table)
+    local total_states
+    qtable=$($REDIS GET q_table 2>/dev/null)
+
+    total_states=$($REDIS GET hyperparameters 2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d.get('total_state_space', '?'))
+except Exception:
+    print('?')
+" 2>/dev/null)
+
     if [ -z "$qtable" ]; then
         echo -e "  ${RED}(kosong)${NC}"
     else
         local count
-        count=$(echo "$qtable" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{len(d)} state dari 125 total')")
-        echo -e "  ${WHT}$count${NC}"
+        count=$(echo "$qtable" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(len(d))
+")
+        echo -e "  ${WHT}${count} state dari ${total_states} total${NC}"
         echo ""
-        echo -e "${CYN}▶ Isi Q-table (semua state → [q_vm3, q_vm4, q_vm5])${NC}"
+        echo -e "${CYN}▶ Isi Q-table (state → [q_vm3, q_vm4, q_vm5])${NC}"
         divider
+
         echo "$qtable" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
-level = {0:'IDLE',1:'LIGHT',2:'MID',3:'HEAVY',4:'CRIT'}
+
+level = {
+    0:'IDLE',
+    1:'LIGHT',
+    2:'MID',
+    3:'HEAVY',
+    4:'CRIT'
+}
+
+rt_level = {
+    0:'FAST',
+    1:'NORMAL',
+    2:'ELEVATED',
+    3:'SLOW',
+    4:'CRIT'
+}
+
 for k, v in sorted(d.items()):
     s = k.split('_')
-    label = f'{level[int(s[0])]}/{level[int(s[1])]}/{level[int(s[2])]}'
-    print(f'  [{k}] ({label}): vm3={v[0]:.4f}  vm4={v[1]:.4f}  vm5={v[2]:.4f}')
+
+    try:
+        labels = []
+        if len(s) >= 3:
+            labels.append(level.get(int(s[0]), s[0]))
+            labels.append(level.get(int(s[1]), s[1]))
+            labels.append(level.get(int(s[2]), s[2]))
+
+        if len(s) >= 4:
+            labels.append('RT=' + rt_level.get(int(s[3]), s[3]))
+
+        label = '/'.join(labels)
+        print(f'  [{k}] ({label}): vm3={v[0]:.4f}  vm4={v[1]:.4f}  vm5={v[2]:.4f}')
+    except Exception:
+        print(f'  [{k}]: {v}')
 " 2>/dev/null
     fi
 }
@@ -207,6 +263,69 @@ for k in keys:
     done <<< "$entries"
 }
 
+cmd_routing_info() {
+    header "ROUTING LOG (qlearning_routing_log)"
+    echo ""
+    local len
+    len=$($REDIS LLEN qlearning_routing_log 2>/dev/null)
+    echo -e "${CYN}▶ Jumlah entry routing tersimpan${NC}"
+    divider
+    echo -e "  ${WHT}${len:-0} entry${NC}"
+    echo ""
+    echo -e "  ${YLW}Cara baca:${NC}"
+    echo -e "    - Routing log bertambah setiap runtime cycle"
+    echo -e "    - Training history hanya bertambah saat training gate lolos"
+}
+
+cmd_routing_last() {
+    header "ROUTING LOG — ENTRY TERBARU"
+    echo ""
+    echo -e "${CYN}▶ Entry routing paling baru${NC}"
+    divider
+    $REDIS LINDEX qlearning_routing_log -1 2>/dev/null | pretty_json | sed 's/^/  /'
+}
+
+cmd_routing_range() {
+    header "ROUTING LOG — 5 ENTRY TERAKHIR"
+    echo ""
+    local entries
+    entries=$($REDIS LRANGE qlearning_routing_log -5 -1 2>/dev/null)
+
+    if [ -z "$entries" ]; then
+        echo -e "  ${YLW}(belum ada routing log)${NC}"
+        return
+    fi
+
+    local i=1
+    while IFS= read -r line; do
+        echo -e "${CYN}▶ Routing Entry $i${NC}"
+        divider
+        echo "$line" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    keys = [
+        'cycle',
+        'training_cycle',
+        'cycle_started_at',
+        'cycle_ended_at',
+        'action',
+        'action_mode',
+        'selected_backend_name',
+        'selected_backend',
+        'routing_weights'
+    ]
+    for k in keys:
+        if k in d:
+            print(f'  {k:22s}: {d[k]}')
+except Exception as e:
+    print('  gagal baca JSON')
+" 2>/dev/null
+        echo ""
+        i=$((i+1))
+    done <<< "$entries"
+}
+
 cmd_last_updated() {
     header "LAST UPDATED"
     show_key "last_updated" "Waktu terakhir data diperbarui ke Redis"
@@ -218,11 +337,14 @@ cmd_all_keys() {
     divider
     local keys=(
         "current_weights"
+        "selected_action"
         "qlearning_training_enabled"
         "qlearning_runtime"
+        "qlearning_runtime_state"
         "qlearning_heartbeat"
         "qlearning_epsilon"
         "qlearning_cycle"
+        "qlearning_training_cycle"
         "q_table"
         "current_state"
         "current_reward"
@@ -231,8 +353,9 @@ cmd_all_keys() {
         "hyperparameters"
         "last_updated"
         "qlearning_history"
+        "qlearning_routing_log"
         "degraded_backends"
-    )   
+    )  
     for key in "${keys[@]}"; do
         local type
         type=$($REDIS TYPE "$key" 2>/dev/null)
@@ -404,7 +527,7 @@ cmd_reset_epsilon() {
 cmd_reset_learning() {
     header "RESET — Mulai Belajar Ulang (Q-table + Epsilon + Cycle)"
     echo ""
-    echo -e "  Yang akan dihapus    : ${RED}q_table, qlearning_epsilon, qlearning_cycle${NC}"
+    echo -e "  Yang akan dihapus    : ${RED}q_table, qlearning_epsilon, qlearning_cycle, qlearning_training_cycle${NC}"
     echo -e "  Yang tetap           : ${GRN}current_weights, heartbeat, history, degraded_backends${NC}"
     echo -e "  Efek                 : Q-Learning mulai dari nol seperti pertama kali jalan"
     echo -e "                         Epsilon = 1.0, cycle = 0, Q-table kosong"
@@ -413,11 +536,13 @@ cmd_reset_learning() {
     if confirm_reset "q_table + epsilon + cycle akan direset. Lanjutkan?"; then
         $REDIS DEL q_table > /dev/null
         $REDIS DEL qlearning_cycle > /dev/null
+        $REDIS DEL qlearning_training_cycle > /dev/null
         $REDIS SET qlearning_epsilon "1.0" > /dev/null
         echo ""
         echo -e "  ${GRN}[OK] q_table dihapus.${NC}"
         echo -e "  ${GRN}[OK] epsilon = 1.0${NC}"
-        echo -e "  ${GRN}[OK] cycle counter dihapus.${NC}"
+        echo -e "  ${GRN}[OK] runtime cycle counter dihapus.${NC}"
+        echo -e "  ${GRN}[OK] training cycle counter dihapus.${NC}"
         echo ""
         echo -e "  ${YLW}Catatan:${NC} training mode tidak diubah."
         echo -e "  Gunakan:"
@@ -438,11 +563,24 @@ cmd_reset_all() {
     echo ""
     echo -e "  Yang akan dihapus:"
     local keys=(
-        "q_table" "current_weights" "qlearning_heartbeat"
-        "qlearning_training_enabled" "qlearning_runtime"
-        "qlearning_epsilon" "qlearning_cycle" "current_state"
-        "current_reward" "qlearning_stats" "qlearning_effectiveness"
-        "hyperparameters" "last_updated" "qlearning_history"
+        "q_table"
+        "current_weights"
+        "selected_action"
+        "qlearning_heartbeat"
+        "qlearning_training_enabled"
+        "qlearning_runtime"
+        "qlearning_runtime_state"
+        "qlearning_epsilon"
+        "qlearning_cycle"
+        "qlearning_training_cycle"
+        "current_state"
+        "current_reward"
+        "qlearning_stats"
+        "qlearning_effectiveness"
+        "hyperparameters"
+        "last_updated"
+        "qlearning_history"
+        "qlearning_routing_log"
         "degraded_backends"
     )
     for k in "${keys[@]}"; do
@@ -472,24 +610,40 @@ cmd_monitor_live() {
     header "LIVE MONITORING (refresh tiap 5 detik)"
     echo -e "  ${YLW}Tekan Ctrl+C untuk berhenti${NC}"
     echo ""
+
     while true; do
         clear
         echo -e "${WHT}═══ Smart LB Redis Monitor — $(date '+%H:%M:%S') ═══${NC}"
 
         # Heartbeat status
         local hb
-        hb=$($REDIS GET qlearning_heartbeat)
+        hb=$($REDIS GET qlearning_heartbeat 2>/dev/null)
+
         local cycle
-        cycle=$($REDIS GET qlearning_cycle)
+        cycle=$($REDIS GET qlearning_cycle 2>/dev/null)
+
+        local training_cycle
+        training_cycle=$($REDIS GET qlearning_training_cycle 2>/dev/null)
+
         local eps
-        eps=$($REDIS GET qlearning_epsilon)
+        eps=$($REDIS GET qlearning_epsilon 2>/dev/null)
 
         if [ -n "$hb" ]; then
-            local now=$(date +%s)
-            local hb_epoch=$(date -d "$hb" +%s 2>/dev/null)
-            local diff=$(( now - hb_epoch ))
-            if [ $diff -le 30 ]; then
-                echo -e "  Status : ${GRN}● AKTIF${NC}  |  Cycle: ${WHT}${cycle}${NC}  |  ε=${WHT}${eps}${NC}  |  HB: ${diff}s ago"
+            local now
+            now=$(date +%s)
+
+            local hb_epoch
+            hb_epoch=$(date -d "$hb" +%s 2>/dev/null)
+
+            local diff
+            if [ -n "$hb_epoch" ]; then
+                diff=$(( now - hb_epoch ))
+            else
+                diff=9999
+            fi
+
+            if [ "$diff" -le 30 ]; then
+                echo -e "  Status : ${GRN}● AKTIF${NC}  |  Runtime Cycle: ${WHT}${cycle:-0}${NC}  |  Training Cycle: ${WHT}${training_cycle:-0}${NC}  |  ε=${WHT}${eps:-?}${NC}  |  HB: ${diff}s ago"
             else
                 echo -e "  Status : ${RED}● FALLBACK${NC} (${diff}s tidak ada heartbeat)"
             fi
@@ -507,52 +661,135 @@ cmd_monitor_live() {
         fi
 
         local runtime_status
-        runtime_status=$($REDIS GET qlearning_runtime 2>/dev/null | python3 -c "import sys,json; 
+        runtime_status=$($REDIS GET qlearning_runtime 2>/dev/null | python3 -c "
+import sys,json
 try:
-    d=json.load(sys.stdin)
-    print(d.get('status','?'))
+    raw=sys.stdin.read().strip()
+    if not raw:
+        print('?')
+    else:
+        d=json.loads(raw)
+        print(d.get('status','?'))
 except Exception:
     print('?')
 " 2>/dev/null)
+
         echo -e "  Runtime : ${WHT}${runtime_status}${NC}"
+
+        local stats_summary
+        stats_summary=$(
+python3 - <<'PY'
+import json
+import subprocess
+
+def redis_get(key):
+    try:
+        out = subprocess.check_output(
+            ["redis-cli", "GET", key],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        return out if out else None
+    except Exception:
+        return None
+
+# Prioritas 1: qlearning_runtime
+# Saat training OFF, qlearning_stats bisa stale,
+# sedangkan qlearning_runtime ditulis saat TRAINING_DISABLED / IDLE_NO_TRAFFIC.
+raw = redis_get("qlearning_runtime")
+if raw:
+    try:
+        d = json.loads(raw)
+        action = d.get("action")
+        mode = d.get("action_mode")
+        tc = d.get("training_cycle")
+
+        if action is not None or mode is not None:
+            print(
+                f"Action: a{action if action is not None else '?'} "
+                f"| Mode: {mode or '?'} "
+                f"| TrainingCycle: {tc if tc is not None else '?'} "
+                f"| Source: runtime"
+            )
+            raise SystemExit
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+# Fallback: qlearning_stats
+raw = redis_get("qlearning_stats")
+if raw:
+    try:
+        d = json.loads(raw)
+        print(
+            f"Action: a{d.get('action','?')} "
+            f"| Mode: {d.get('action_mode','?')} "
+            f"| TrainingCycle: {d.get('training_cycle','?')} "
+            f"| Source: stats"
+        )
+    except Exception:
+        print("")
+PY
+)
+
+        if [ -n "$stats_summary" ]; then
+            echo -e "  Last    : ${WHT}${stats_summary}${NC}"
+        fi
 
         divider
 
         # Weights
         echo -e "${CYN}Bobot aktif:${NC}"
-        $REDIS GET current_weights | python3 -c "
+        $REDIS GET current_weights 2>/dev/null | python3 -c "
 import sys, json
 try:
-    d = json.load(sys.stdin)
-    for ip, w in d.items():
-        bar = '█' * (w // 5)
-        print(f'  .{ip.split(\".\")[-1]:>3} : {bar:<20} {w}%')
-except: pass
+    raw=sys.stdin.read().strip()
+    if not raw:
+        print('  (belum ada current_weights)')
+    else:
+        d = json.loads(raw)
+        for ip, w in d.items():
+            w = int(w)
+            bar = '█' * (w // 5)
+            print(f'  .{ip.split(\".\")[-1]:>3} : {bar:<20} {w}%')
+except Exception:
+    print('  (gagal membaca current_weights)')
 " 2>/dev/null
 
         divider
 
         # Last reward
         echo -e "${CYN}Reward terakhir:${NC}"
-        $REDIS GET current_reward | python3 -c "
+        $REDIS GET current_reward 2>/dev/null | python3 -c "
 import sys, json
 try:
-    d = json.load(sys.stdin)
-    print(f'  Total: {d[\"total\"]}  |  RT: {d[\"rt_normalized\"]}  |  Bal: {d[\"load_imbalance\"]}  |  OL: {d[\"overload_count\"]}')
-except: pass
+    raw=sys.stdin.read().strip()
+    if not raw:
+        print('  (belum ada reward; normal jika training OFF)')
+    else:
+        d = json.loads(raw)
+        print(f\"  Total: {d.get('total','?')}  |  RT: {d.get('rt_normalized','?')}  |  Bal: {d.get('load_imbalance','?')}  |  OL: {d.get('overload_count','?')}\")
+except Exception:
+    print('  (gagal membaca current_reward)')
 " 2>/dev/null
 
         divider
 
         # Effectiveness
-        $REDIS GET qlearning_effectiveness | python3 -c "
+        echo -e "${CYN}Efektivitas Q-Learning:${NC}"
+        $REDIS GET qlearning_effectiveness 2>/dev/null | python3 -c "
 import sys, json
 try:
-    d = json.load(sys.stdin)
-    print(f'  Fase    : {d[\"phase\"]}')
-    print(f'  Avg RT  : {d[\"avg_rt_last_50\"]}ms  |  RT Improve: {d[\"rt_improvement_pct\"]}%')
-    print(f'  Exploit : {d[\"exploit_ratio_pct\"]}%  |  Q-states: {d[\"q_table_states_visited\"]}/125')
-except: pass
+    raw=sys.stdin.read().strip()
+    if not raw:
+        print('  (belum ada effectiveness; normal sebelum training valid)')
+    else:
+        d = json.loads(raw)
+        print(f\"  Fase    : {d.get('phase','?')}\")
+        print(f\"  Avg RT  : {d.get('avg_rt_last_50','?')}ms  |  RT Improve: {d.get('rt_improvement_pct','?')}%\")
+        print(f\"  Exploit : {d.get('exploit_ratio_pct','?')}%  |  Q-states: {d.get('q_table_states_visited','?')}/{d.get('q_table_total_states','?')}\")
+except Exception:
+    print('  (gagal membaca qlearning_effectiveness)')
 " 2>/dev/null
 
         echo ""
@@ -586,6 +823,10 @@ show_menu() {
     echo -e "  ${CYN}[hl]${NC} history last            — Entry terbaru"
     echo -e "  ${CYN}[hf]${NC} history first           — Entry pertama"
     echo -e "  ${CYN}[hr]${NC} history range           — 5 entry terakhir"
+    echo ""
+    echo -e "  ${CYN}[ri]${NC} routing info            — Jumlah entry routing log"
+    echo -e "  ${CYN}[rl]${NC} routing last            — Routing entry terbaru"
+    echo -e "  ${CYN}[rr]${NC} routing range           — 5 routing entry terakhir"
     echo ""
     echo -e "  ${GRN}[a]${NC}  semua key               — Daftar semua key & status"
     echo -e "  ${GRN}[m]${NC}  live monitor            — Refresh tiap 5 detik"
@@ -629,6 +870,9 @@ if [ -n "$1" ]; then
         historylast|hl)    cmd_history_last ;;
         historyfirst|hf)   cmd_history_first ;;
         historyrange|hr)   cmd_history_range ;;
+        routing|routinginfo|ri)      cmd_routing_info ;;
+        routinglast|rl)              cmd_routing_last ;;
+        routingrange|rr)             cmd_routing_range ;;
         all|a)             cmd_all_keys ;;
         monitor|m)         cmd_monitor_live ;;
         reset-qtable|r1)   cmd_reset_qtable ;;
@@ -637,7 +881,7 @@ if [ -n "$1" ]; then
         reset-all|r4)      cmd_reset_all ;;
         *)
             echo "Key tidak dikenal: $1"
-            echo "Gunakan: bash redis_inspect.sh [weights|heartbeat|cycle|epsilon|qtable|state|reward|stats|effectiveness|hyperparams|degraded|training|train-on|train-off|history|all|monitor|reset-qtable|reset-epsilon|reset-learn|reset-all]"
+            echo "Gunakan: bash redis_inspect.sh [weights|heartbeat|cycle|epsilon|qtable|state|reward|stats|effectiveness|hyperparams|degraded|training|train-on|train-off|history|historylast|historyfirst|historyrange|routing|routinglast|routingrange|all|monitor|reset-qtable|reset-epsilon|reset-learn|reset-all]"
             ;;
     esac
     exit 0
@@ -646,7 +890,7 @@ fi
 # Mode menu interaktif
 while true; do
     show_menu
-    echo -n "Pilih [1-12/h/hl/hf/hr/a/m/t/ton/toff/r1-r4/q]: "
+    echo -n "Pilih [1-12/h/hl/hf/hr/ri/rl/rr/a/m/t/ton/toff/r1-r4/q]: "
     read -r choice
     case "$choice" in
         1)   cmd_weights ;;
@@ -661,19 +905,28 @@ while true; do
         10)  cmd_hyperparams ;;
         11)  cmd_last_updated ;;
         12)  cmd_degraded ;;
+
         h)   cmd_history_info ;;
         hl)  cmd_history_last ;;
         hf)  cmd_history_first ;;
         hr)  cmd_history_range ;;
+
+        ri)  cmd_routing_info ;;
+        rl)  cmd_routing_last ;;
+        rr)  cmd_routing_range ;;
+
         a)   cmd_all_keys ;;
         m)   cmd_monitor_live ;;
-        t)   cmd_training_status ;;
-        ton) cmd_training_on ;;
+
+        t)    cmd_training_status ;;
+        ton)  cmd_training_on ;;
         toff) cmd_training_off ;;
+
         r1)  cmd_reset_qtable ;;
         r2)  cmd_reset_epsilon ;;
         r3)  cmd_reset_learning ;;
         r4)  cmd_reset_all ;;
+
         q)   echo ""; echo "Selesai."; break ;;
         *)   echo -e "${RED}Pilihan tidak valid.${NC}" ;;
     esac
